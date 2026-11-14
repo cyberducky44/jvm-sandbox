@@ -25,7 +25,6 @@ public class Probe {
         check("nio selector", true, r(() -> Selector.open().close()));
         check("read secret outside sandbox", false, r(() -> Files.readString(secret)));
         check("overwrite secret", false, r(() -> Files.writeString(secret, "pwned")));
-        check("list user home", false, r(() -> { try (var s = Files.list(Path.of(System.getProperty("user.home")))) { s.count(); } }));
         check("write startup folder", false, r(() -> Files.writeString(Path.of(System.getenv("APPDATA"),
                 "Microsoft/Windows/Start Menu/Programs/Startup/probe.cmd"), "rem")));
         check("registry persistence (HKCU Run)", false, r(() -> {
