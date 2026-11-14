@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# jvm-sandbox for Linux: same command line as the Windows version, built on bubblewrap.
+# The kernel (namespaces) does the confinement, so the JVM runs unmodified at full speed.
+#
+# The game sees: the system (/usr, /etc, ...) read-only, an EMPTY home directory, and only the
+# folders it needs bound in on top. No session D-Bus, no keyring, no ssh-agent, no other processes.
+set -euo pipefail
+
+verbose=0 net=1 x11=1 logfile=
+declare -a rw=() ro=() deny=() gamedirs=()
+
+log() {
+    echo "[jvm-sandbox] $*" >&2
+    if [ -n "$logfile" ]; then echo "$(date +%T) $*" >>"$logfile" 2>/dev/null || true; fi
+}
+vlog() { if [ "$verbose" = 1 ]; then log "$@"; fi; }
+
+usage() {
+    cat >&2 <<'EOF'
+usage: jvm-sandbox [options] [--] <java> [java args...]
+  --rw <path>    extra path the sandbox may read and write
+  --ro <path>    extra path the sandbox may read
+  --deny <path>  path the sandbox must not read, even if a parent folder is granted
+  --no-clipboard hide the X11 display (needs Wayland); X11 cannot stop clipboard access
+  --no-net       no network access at all
+  --verbose      print what is being granted
+  --log <file>   also append this wrapper's messages to a file
+  --name, --lan, --no-elevate   accepted for compatibility with the Windows version
+Auto-granted: the Java home (ro), classpath / -jar / -javaagent / java.library.path /
+--assetsDir (ro), --gameDir and $INST_DIR (rw). Everything else in your home is hidden.
+EOF
+}
+
+# Refuse to open up locations that would defeat the point of the sandbox.
+too_broad() {
+    case "$HOME/" in "${1%/}/"*) return 0 ;; esac   # / , /home, $HOME itself
+    return 1
+}
+
+want() { # want rw|ro <path>
+    local p
+    p=$(realpath -m -- "$2") || return 0
+    [ -e "$p" ] || return 0
+    if too_broad "$p"; then log "refusing to grant access to $p (too broad)"; return 0; fi
+    if [ "$1" = rw ]; then rw+=("$p"); else ro+=("$p"); fi
+}
+
+want_list() { # colon-separated list of ro paths
+    local IFS=: e
+    for e in $1; do
+        e=${e%\*}
+        [ -n "$e" ] && want ro "$e"
+    done
+}
+
+# ---------- options ----------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        --rw) want rw "$2"; shift 2 ;;
+        --ro) want ro "$2"; shift 2 ;;
+        --deny) deny+=("$(realpath -m -- "$2")"); shift 2 ;;
+        --log) logfile=$2; shift 2 ;;
+        --name) shift 2 ;;
+        --no-net) net=0; shift ;;
+        --no-clipboard) x11=0; shift ;;
+        --verbose) verbose=1; shift ;;
+        --lan|--no-elevate) shift ;;
+        -h|--help) usage; exit 0 ;;
+        --*) log "unknown option $1"; usage; exit 2 ;;
+        *) break ;;
+    esac
+done
+[ $# -gt 0 ] || { usage; exit 2; }
+command -v bwrap >/dev/null || { log "error: bubblewrap is not installed (package 'bubblewrap')"; exit 126; }
+
+exe=$(command -v -- "$1") || { log "error: cannot find $1"; exit 126; }
+exe=$(readlink -f -- "$exe")
+shift
+cmd=("$@")
+
+# ---------- work out what the game legitimately needs ----------
+javahome=
+if [ "$(basename "$(dirname "$exe")")" = bin ]; then
+    javahome=$(dirname "$(dirname "$exe")")
+else
+    want ro "$exe"
+fi
+
+i=0
+while [ $i -lt ${#cmd[@]} ]; do
+    a=${cmd[$i]}
+    next=${cmd[$((i + 1))]:-}
+    case "$a" in
+        -cp|-classpath|--class-path|-p|--module-path) want_list "$next"; i=$((i + 1)) ;;
+        --class-path=*) want_list "${a#--class-path=}" ;;
+        -Djava.library.path=*) want_list "${a#-Djava.library.path=}" ;;
+        -javaagent:*) a=${a#-javaagent:}; want ro "${a%%=*}" ;;
+        -jar) want ro "$next"; i=$((i + 1)) ;;
+        --gameDir) want rw "$next"; gamedirs+=("$(realpath -m -- "$next")"); i=$((i + 1)) ;;
+        --assetsDir) want ro "$next"; i=$((i + 1)) ;;
+    esac
+    i=$((i + 1))
+done
+
+if [ -n "${INST_DIR:-}" ] && [ -d "$INST_DIR" ]; then      # Prism Launcher / MultiMC
+    want rw "$INST_DIR"
+    root=$(realpath -m -- "$INST_DIR/../..")
+    want ro "$root/libraries"
+    want ro "$root/assets"
+fi
+# Lunar Client keeps its jars, natives, profiles, mods, logs and settings in ~/.lunarclient
+if [ -d "$HOME/.lunarclient" ]; then
+    case "$exe ${cmd[*]} $PWD" in *"$HOME/.lunarclient"*) want rw "$HOME/.lunarclient" ;; esac
+fi
+
+# ---------- build the sandbox ----------
+args=(--unshare-all --die-with-parent --new-session)
+[ "$net" = 1 ] && args+=(--share-net)
+
+args+=(--ro-bind /usr /usr)
+for d in /bin /sbin /lib /lib32 /lib64 /libx32; do
+    if [ -L "$d" ]; then args+=(--symlink "$(readlink "$d")" "$d")
+    elif [ -d "$d" ]; then args+=(--ro-bind "$d" "$d"); fi
+done
+args+=(--ro-bind /etc /etc --ro-bind-try /opt /opt --ro-bind-try /nix /nix
+       --ro-bind /sys /sys --proc /proc --dev /dev
+       --tmpfs /tmp --tmpfs /run --tmpfs /var --tmpfs "$HOME")
+# DNS config is often a symlink to somewhere outside /etc
+resolv=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+case "$resolv" in /etc/*|'') ;; *) [ -e "$resolv" ] && args+=(--ro-bind "$resolv" "$resolv") ;; esac
+# GPU and sound devices
+args+=(--dev-bind-try /dev/dri /dev/dri --dev-bind-try /dev/snd /dev/snd)
+for d in /dev/nvidia* /dev/dxg; do [ -e "$d" ] && args+=(--dev-bind "$d" "$d"); done
+[ -d /usr/lib/wsl ] && args+=(--ro-bind /usr/lib/wsl /usr/lib/wsl)
+
+# Display and sound sockets. Deliberately NOT passed in: the D-Bus session bus (keyring,
+# secret service, portals), ssh-agent, gpg-agent.
+xrd=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+args+=(--dir "$xrd" --chmod 0700 "$xrd")
+if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -e "$xrd/$WAYLAND_DISPLAY" ]; then
+    args+=(--ro-bind "$xrd/$WAYLAND_DISPLAY" "$xrd/$WAYLAND_DISPLAY")
+elif [ "$x11" = 0 ]; then
+    log "warning: --no-clipboard needs a Wayland session; no display will be available"
+fi
+if [ "$x11" = 1 ] && [ -n "${DISPLAY:-}" ]; then
+    [ -d /tmp/.X11-unix ] && args+=(--ro-bind /tmp/.X11-unix /tmp/.X11-unix)
+    xauth=${XAUTHORITY:-$HOME/.Xauthority}
+    [ -f "$xauth" ] && args+=(--ro-bind "$xauth" "$xauth")
+else
+    args+=(--unsetenv DISPLAY --unsetenv XAUTHORITY)
+fi
+for s in pipewire-0 pulse; do [ -e "$xrd/$s" ] && args+=(--ro-bind "$xrd/$s" "$xrd/$s"); done
+[ -f "$HOME/.config/pulse/cookie" ] && args+=(--ro-bind "$HOME/.config/pulse/cookie" "$HOME/.config/pulse/cookie")
+args+=(--unsetenv DBUS_SESSION_BUS_ADDRESS --unsetenv SSH_AUTH_SOCK --unsetenv GPG_AGENT_INFO
+       --unsetenv GNOME_KEYRING_CONTROL --unsetenv SSH_AGENT_PID --unsetenv TMPDIR)
+
+# Granted folders, parents before children so a nested grant lands on top of its parent.
+while IFS=$'\t' read -r p mode; do
+    [ -n "$p" ] || continue
+    if [ "$mode" = rw ]; then args+=(--bind "$p" "$p"); else args+=(--ro-bind "$p" "$p"); fi
+    vlog "granted $mode $p"
+done < <({ for p in ${rw[@]+"${rw[@]}"}; do printf '%s\trw\n' "$p"; done
+           for p in ${ro[@]+"${ro[@]}"}; do printf '%s\tro\n' "$p"; done; } | sort -u)
+
+# Protected spots, mounted last so they win over any grant around them.
+# The Java install stays read-only so a mod cannot plant code in it.
+if [ -n "$javahome" ]; then
+    case "$javahome" in /usr/*|/opt/*|/nix/*) ;; *) args+=(--ro-bind "$javahome" "$javahome"); vlog "protected $javahome (read-only)" ;; esac
+fi
+# Saved logins of the official launcher live in the game directory.
+for gd in ${gamedirs[@]+"${gamedirs[@]}"}; do
+    for f in "$gd"/launcher_accounts* "$gd"/launcher_msa_credentials*; do [ -e "$f" ] && deny+=("$f"); done
+done
+for p in ${deny[@]+"${deny[@]}"}; do
+    if [ -d "$p" ]; then args+=(--tmpfs "$p"); elif [ -e "$p" ]; then args+=(--ro-bind /dev/null "$p"); else continue; fi
+    vlog "protected $p (no access)"
+done
+
+# Keep the working directory if it exists inside the sandbox.
+cwd=/
+for p in ${rw[@]+"${rw[@]}"} ${ro[@]+"${ro[@]}"} /usr /opt /etc; do
+    case "$PWD/" in "$p"/*) cwd=$PWD ;; esac
+done
+[ "$cwd" = "$PWD" ] || vlog "working directory $PWD is not granted; starting in /"
+args+=(--chdir "$cwd")
+
+vlog "starting $exe (${#cmd[@]} args)"
+exec bwrap "${args[@]}" -- "$exe" ${cmd[@]+"${cmd[@]}"}
