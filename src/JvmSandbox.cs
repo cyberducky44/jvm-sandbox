@@ -13,14 +13,14 @@ static class JvmSandbox
     const uint RW = 0x1301BF | 0x40;     // modify + FILE_DELETE_CHILD
     const uint LIST = 0x1200A1;          // list names + traverse + read attributes, this folder only
 
-    const uint WRITE = 0x10156;          // write/append/delete bits, used for deny entries
-    const uint ALL = 0x1F01FF;
 
     static bool verbose;
     static string logPath, javaHome;
     static readonly List<string> gameDirs = new List<string>();
+    static readonly List<string> shields = new List<string>();
     static IntPtr containerSid;
     static IntPtr allPackagesSid;
+    static IntPtr restrictedPackagesSid;
     static readonly Dictionary<string, uint> grants = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
 
     static int Main(string[] args)
@@ -34,12 +34,12 @@ static class JvmSandbox
         if (args.Length >= 2 && args[0] == "--grant-list")   // elevated helper, see below
         {
             ConvertStringSidToSidW(args[1], out containerSid);
-            ConvertStringSidToSidW("S-1-15-2-1", out allPackagesSid);
+            ConvertStringSidToSidW("S-1-15-2-1", out allPackagesSid); ConvertStringSidToSidW("S-1-15-2-2", out restrictedPackagesSid);
             for (int k = 2; k < args.Length; k++) Grant(args[k], LIST, false);
             return 0;
         }
         string name = "jvm-sandbox";
-        bool net = true, lan = false, elevate = true;
+        bool net = true, lan = false, elevate = true, clipboard = true;
         int i = 0;
         for (; i < args.Length; i++)
         {
@@ -48,6 +48,8 @@ static class JvmSandbox
             if (a == "--rw" && i + 1 < args.Length) Want(args[++i], RW);
             else if (a == "--ro" && i + 1 < args.Length) Want(args[++i], RO);
             else if (a == "--name" && i + 1 < args.Length) name = "jvm-sandbox." + args[++i];
+            else if (a == "--deny" && i + 1 < args.Length) shields.Add(Path.GetFullPath(args[++i]));
+            else if (a == "--no-clipboard") clipboard = false;
             else if (a == "--no-net") net = false;
             else if (a == "--lan") lan = true;
             else if (a == "--verbose") verbose = true;
@@ -95,7 +97,7 @@ static class JvmSandbox
             hr = DeriveAppContainerSidFromAppContainerName(name, out containerSid);
             if (hr != 0) throw new Exception("cannot create AppContainer profile (0x" + hr.ToString("X8") + ")");
         }
-        ConvertStringSidToSidW("S-1-15-2-1", out allPackagesSid);
+        ConvertStringSidToSidW("S-1-15-2-1", out allPackagesSid); ConvertStringSidToSidW("S-1-15-2-2", out restrictedPackagesSid);
         IntPtr sidStrPtr;
         ConvertSidToStringSidW(containerSid, out sidStrPtr);
         string sidStr = Marshal.PtrToStringUni(sidStrPtr);
@@ -118,18 +120,24 @@ static class JvmSandbox
             if (!Grant(g.Key, g.Value, true) && !File.Exists(g.Key) && !Directory.Exists(g.Key)) continue;
             for (DirectoryInfo d = Directory.GetParent(g.Key); d != null; d = d.Parent) parents[d.FullName] = true;
         }
-        // The launcher's own files must not be writable (or, for stored logins, readable) by mods,
-        // even when they sit inside a folder the game may write to.
+        // Carve protected spots out of the granted folders. (Deny entries do not work for this:
+        // Windows ignores them for AppContainer identities, so the grant itself has to be removed.)
+        // The Java install stays read-only so a mod cannot plant code in it.
         if (javaHome != null)
             foreach (KeyValuePair<string, uint> g in grants)
                 if ((g.Value & RW) == RW && javaHome.StartsWith(g.Key + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-                { Grant(javaHome, WRITE, true, true); break; }
+                { Shield(javaHome, RO); break; }
+        // Saved logins of the official launcher live in the game directory.
         foreach (string gd in gameDirs)
         {
             if (!Directory.Exists(gd)) continue;
             foreach (string pat in new string[] { "launcher_accounts*", "launcher_msa_credentials*" })
-                foreach (string f in Directory.GetFiles(gd, pat)) Grant(f, ALL, true, true);
+                foreach (string f in Directory.GetFiles(gd, pat)) Shield(f, 0);
         }
+        // Program Files is readable by every AppContainer, and Steam keeps its login files there.
+        string pf86 = Environment.GetEnvironmentVariable("ProgramFiles(x86)");
+        if (pf86 != null) shields.Add(Path.Combine(pf86, "Steam", "config"));
+        foreach (string sh in shields) Shield(sh, 0);
         List<string> needAdmin = new List<string>();
         foreach (string p in parents.Keys)
             if (!grants.ContainsKey(p) && !Grant(p, LIST, false)) needAdmin.Add(p);
@@ -187,6 +195,12 @@ static class JvmSandbox
         IntPtr jlPtr = Marshal.AllocHGlobal(jlSize);
         Marshal.StructureToPtr(jl, jlPtr, false);
         SetInformationJobObject(job, 9, jlPtr, (uint)jlSize);
+        if (!clipboard)
+        {
+            IntPtr ui = Marshal.AllocHGlobal(4);
+            Marshal.WriteInt32(ui, 0x2 | 0x4);   // JOB_OBJECT_UILIMIT_READCLIPBOARD | WRITECLIPBOARD
+            SetInformationJobObject(job, 4, ui, 4);
+        }
 
         // --- launch ---
         STARTUPINFOEX si = new STARTUPINFOEX();
@@ -225,6 +239,8 @@ static class JvmSandbox
             "  --rw <path>    extra path the sandbox may read and write\n" +
             "  --ro <path>    extra path the sandbox may read\n" +
             "  --name <id>    use a separate sandbox identity (isolates instances from each other)\n" +
+            "  --deny <path>  path the sandbox must not read, even if a parent folder is granted\n" +
+            "  --no-clipboard the game cannot read or change the clipboard\n" +
             "  --no-net       no network access at all\n" +
             "  --lan          also allow LAN access and listening (hosting / LAN worlds)\n" +
             "  --log <file>   also append this wrapper's messages to a file\n" +
@@ -313,8 +329,7 @@ static class JvmSandbox
     }
 
     // Returns true if the sandbox has (or now has) the access.
-    // With deny=true, adds a deny entry instead (overrides anything inherited from a parent).
-    static bool Grant(string path, uint access, bool inherit, bool deny = false)
+    static bool Grant(string path, uint access, bool inherit)
     {
         bool dir = Directory.Exists(path);
         if (!dir && !File.Exists(path)) return false;
@@ -322,11 +337,11 @@ static class JvmSandbox
         if (GetNamedSecurityInfoW(path, 1, 4, IntPtr.Zero, IntPtr.Zero, out dacl, IntPtr.Zero, out sd) != 0) return false;
         try
         {
-            if (HasAccess(dacl, access, deny)) return true;   // already set: nothing to do (keeps relaunches instant)
-            if (inherit && !deny && TooBroad(path)) { Log("refusing to grant access to " + path + " (too broad)"); return true; }
+            if (HasAccess(dacl, access)) return true;   // already granted: nothing to do (keeps relaunches instant)
+            if (inherit && TooBroad(path)) { Log("refusing to grant access to " + path + " (too broad)"); return true; }
             EXPLICIT_ACCESS ea = new EXPLICIT_ACCESS();
             ea.grfAccessPermissions = access;
-            ea.grfAccessMode = deny ? 3 : 1;        // DENY_ACCESS : GRANT_ACCESS
+            ea.grfAccessMode = 1;                   // GRANT_ACCESS
             ea.grfInheritance = dir && inherit ? 3u : 0u;      // children inherit
             ea.TrusteeForm = 0;                     // TRUSTEE_IS_SID
             ea.TrusteeType = 5;                     // well-known group
@@ -350,14 +365,89 @@ static class JvmSandbox
                 Marshal.FreeHGlobal(nsd);
             }
             if (rc != 0 && inherit) Log("warning: could not grant access to " + path + " (error " + rc + ")");
-            else if (rc == 0 && verbose) Log((deny ? "denied " : "granted ") + (access == WRITE ? "write " : access == ALL ? "all " : access == LIST ? "list " : access == RO ? "ro " : "rw ") + path);
+            else if (rc == 0 && verbose) Log("granted " + (access == LIST ? "list " : access == RO ? "ro " : "rw ") + path);
             if (newDacl != IntPtr.Zero) LocalFree(newDacl);
             return rc == 0;
         }
         finally { LocalFree(sd); }
     }
 
-    static bool HasAccess(IntPtr dacl, uint want, bool deny)
+    // Limits the sandbox to exactly `access` on a path (0 = nothing), regardless of what its parent
+    // folders grant. Done by giving the path its own, non-inherited permission list: a copy of the
+    // current one minus every entry for this sandbox and for "all app packages".
+    static void Shield(string path, uint access)
+    {
+        bool dir = Directory.Exists(path);
+        if (!dir && !File.Exists(path)) return;
+        IntPtr dacl, sd;
+        if (GetNamedSecurityInfoW(path, 1, 4, IntPtr.Zero, IntPtr.Zero, out dacl, IntPtr.Zero, out sd) != 0 || dacl == IntPtr.Zero) return;
+        try
+        {
+            int count = (ushort)Marshal.ReadInt16(dacl, 4), size = (ushort)Marshal.ReadInt16(dacl, 2);
+            uint have = 0; bool foreign = false;
+            for (int i = 0; i < count; i++)
+            {
+                IntPtr ace;
+                if (!GetAce(dacl, (uint)i, out ace)) continue;
+                if (Marshal.ReadByte(ace, 0) > 1) continue;
+                IntPtr sid = new IntPtr(ace.ToInt64() + 8);
+                if (IsAnyPackage(sid)) foreign = true;
+                else if (EqualSid(sid, containerSid))
+                {
+                    if (Marshal.ReadByte(ace, 0) == 1) foreign = true;   // stale deny entry from an older version
+                    else if ((Marshal.ReadByte(ace, 1) & 0x8) == 0) have |= (uint)Marshal.ReadInt32(ace, 4);
+                }
+            }
+            ushort ctl; uint rev;
+            GetSecurityDescriptorControl(sd, out ctl, out rev);
+            if ((ctl & 0x1000) != 0 && have == access && !foreign) return;   // already shielded
+
+            IntPtr acl = Marshal.AllocHGlobal(size + 16);
+            InitializeAcl(acl, (uint)size + 16, Marshal.ReadByte(dacl, 0));
+            for (int pass = 1; pass >= 0; pass--)          // deny entries first, then allow entries
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr ace;
+                    if (!GetAce(dacl, (uint)i, out ace)) continue;
+                    byte type = Marshal.ReadByte(ace, 0);
+                    if ((type == 1) != (pass == 1)) continue;
+                    if (type <= 1)
+                    {
+                        IntPtr sid = new IntPtr(ace.ToInt64() + 8);
+                        if (EqualSid(sid, containerSid) || IsAnyPackage(sid)) continue;
+                    }
+                    int aceSize = (ushort)Marshal.ReadInt16(ace, 2);
+                    byte[] raw = new byte[aceSize];
+                    Marshal.Copy(ace, raw, 0, aceSize);
+                    raw[1] = (byte)(raw[1] & ~0x10);       // no longer "inherited": it is this path's own entry now
+                    IntPtr tmp = Marshal.AllocHGlobal(aceSize);
+                    Marshal.Copy(raw, 0, tmp, aceSize);
+                    AddAce(acl, Marshal.ReadByte(dacl, 0), 0xFFFFFFFF, tmp, (uint)aceSize);
+                    Marshal.FreeHGlobal(tmp);
+                }
+            IntPtr final = acl;
+            uint rc = 0;
+            if (access != 0)
+            {
+                EXPLICIT_ACCESS ea = new EXPLICIT_ACCESS();
+                ea.grfAccessPermissions = access; ea.grfAccessMode = 1; ea.grfInheritance = dir ? 3u : 0u;
+                ea.TrusteeForm = 0; ea.TrusteeType = 5; ea.ptstrName = containerSid;
+                rc = SetEntriesInAclW(1, ref ea, acl, out final);
+            }
+            // 0x80000000 = PROTECTED_DACL: stop inheriting from the parent folder
+            if (rc == 0) rc = SetNamedSecurityInfoW(path, 1, 4 | 0x80000000, IntPtr.Zero, IntPtr.Zero, final, IntPtr.Zero);
+            if (rc != 0) Log("warning: could not protect " + path + " from the sandbox (error " + rc + ")");
+            else if (verbose) Log("protected " + path + (access == 0 ? " (no access)" : " (read-only)"));
+            if (final != acl) LocalFree(final);
+            Marshal.FreeHGlobal(acl);
+        }
+        finally { LocalFree(sd); }
+    }
+
+    // "All app packages" and "all restricted app packages": entries for either apply to every AppContainer.
+    static bool IsAnyPackage(IntPtr sid) { return EqualSid(sid, allPackagesSid) || EqualSid(sid, restrictedPackagesSid); }
+
+    static bool HasAccess(IntPtr dacl, uint want)
     {
         if (dacl == IntPtr.Zero) return false;
         int count = (ushort)Marshal.ReadInt16(dacl, 4);
@@ -367,9 +457,9 @@ static class JvmSandbox
             IntPtr ace;
             if (!GetAce(dacl, (uint)i, out ace)) continue;
             byte type = Marshal.ReadByte(ace, 0), aceFlags = Marshal.ReadByte(ace, 1);
-            if (type != (deny ? 1 : 0) || (aceFlags & 0x8) != 0) continue;   // entries that apply to this object
+            if (type != 0 || (aceFlags & 0x8) != 0) continue;   // allow entries that apply to this object
             IntPtr sid = new IntPtr(ace.ToInt64() + 8);
-            if (EqualSid(sid, containerSid) || (!deny && EqualSid(sid, allPackagesSid)))
+            if (EqualSid(sid, containerSid) || IsAnyPackage(sid))
                 have |= (uint)Marshal.ReadInt32(ace, 4);
         }
         if ((have & 0x10000000) != 0) return true;              // GENERIC_ALL
@@ -443,6 +533,8 @@ static class JvmSandbox
     [DllImport("advapi32.dll")] static extern bool SetSecurityDescriptorDacl(IntPtr sd, bool present, IntPtr dacl, bool defaulted);
     [DllImport("advapi32.dll")] static extern bool SetSecurityDescriptorControl(IntPtr sd, ushort mask, ushort bits);
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool SetFileSecurityW(string path, uint info, IntPtr sd);
+    [DllImport("advapi32.dll")] static extern bool InitializeAcl(IntPtr acl, uint len, uint revision);
+    [DllImport("advapi32.dll")] static extern bool AddAce(IntPtr acl, uint revision, uint index, IntPtr aces, uint len);
     [DllImport("advapi32.dll")] static extern bool GetAce(IntPtr acl, uint index, out IntPtr ace);
     [DllImport("advapi32.dll")] static extern bool EqualSid(IntPtr a, IntPtr b);
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);

@@ -36,6 +36,8 @@ eats backslashes:
 | `--rw <path>` | extra path the game may read and write |
 | `--ro <path>` | extra path the game may read |
 | `--name <id>` | separate sandbox identity, so instances can't read each other |
+| `--deny <path>` | path the game must not read, even inside a granted folder |
+| `--no-clipboard` | the game can't read or change the clipboard (breaks paste in chat) |
 | `--no-net` | no network at all |
 | `--lan` | also allow LAN connections and listening (LAN worlds, hosting) |
 | `--no-elevate` | never show the one-time admin prompt |
@@ -55,11 +57,17 @@ Granted automatically, worked out from the command line and environment:
 Everything else in your user profile and on other drives is denied, as is writing to the
 registry or to any startup location.
 
-Two things are blocked even inside the writable folders:
+Some spots are blocked even though a parent folder is readable or writable:
 
 - the official launcher's saved logins (`launcher_accounts*`, `launcher_msa_credentials*`) in
   the game directory can't be read
 - the Java install can't be written to, so a mod can't plant code there
+- Steam's login files (`Program Files (x86)\Steam\config`) can't be read; Windows lets every
+  AppContainer read Program Files by default
+- anything you pass to `--deny`
+
+These are done by giving the path its own permission list without the sandbox on it. Deny
+entries don't work: Windows ignores them for AppContainer identities.
 
 The first run adds permissions to the folders above. Parent folders of those paths get a
 "list names only" permission, because Java resolves paths by looking each component up in its
@@ -69,6 +77,11 @@ parent. For `C:\` and `C:\Users` that takes one admin prompt, once.
 
 - A mod runs inside the game, so it can still use the game's own session token and anything
   in the instance folder. Don't point the game directory at a folder holding other secrets.
+- A mod can take screenshots of your whole screen while the game runs, and read the clipboard
+  unless you pass `--no-clipboard`. Don't have a seed phrase on screen or in the clipboard
+  while playing untrusted mods.
+- Other programs installed under Program Files are readable. Their secrets normally live in
+  your user profile (blocked), but use `--deny` for any that keep them next to the program.
 - A mod can still modify other files in the game folder (other mods, jars). Keep launching
   through the sandbox; a tampered file would run unsandboxed if you stop.
 - The sandbox can see file and folder *names* (not contents) in the parent folders of granted
@@ -85,3 +98,12 @@ parent. For `C:\` and `C:\Users` that takes one admin prompt, once.
 
     cd <some empty dir containing Probe.java>
     jvm-sandbox --rw . -- java Probe.java . C:\path\to\a\file\outside
+
+`test\StealerProbe.java` tries what an info-stealer would: Discord's token store, browser
+passwords and cookies, wallet folders, SSH keys, Steam, reading or injecting into another
+process (pass its pid), Discord's local ports, clipboard, screenshots, registry. It only
+reports allowed or denied; it never reads out, decrypts or sends anything. Run it once
+normally and once through the sandbox and compare (needs Java 22+):
+
+    java --enable-native-access=ALL-UNNAMED -Dnowrite=1 StealerProbe.java <discord pid>
+    jvm-sandbox -- java --enable-native-access=ALL-UNNAMED StealerProbe.java <discord pid>
