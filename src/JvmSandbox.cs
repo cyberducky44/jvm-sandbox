@@ -13,7 +13,12 @@ static class JvmSandbox
     const uint RW = 0x1301BF | 0x40;     // modify + FILE_DELETE_CHILD
     const uint LIST = 0x1200A1;          // list names + traverse + read attributes, this folder only
 
+    const uint WRITE = 0x10156;          // write/append/delete bits, used for deny entries
+    const uint ALL = 0x1F01FF;
+
     static bool verbose;
+    static string logPath, javaHome;
+    static readonly List<string> gameDirs = new List<string>();
     static IntPtr containerSid;
     static IntPtr allPackagesSid;
     static readonly Dictionary<string, uint> grants = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
@@ -46,6 +51,7 @@ static class JvmSandbox
             else if (a == "--no-net") net = false;
             else if (a == "--lan") lan = true;
             else if (a == "--verbose") verbose = true;
+            else if (a == "--log" && i + 1 < args.Length) logPath = args[++i];
             else if (a == "--no-elevate") elevate = false;
             else if (a == "--help" || a == "-h" || a == "/?") { Usage(); return 0; }
             else if (a.StartsWith("--")) { Log("unknown option " + a); Usage(); return 2; }
@@ -61,10 +67,14 @@ static class JvmSandbox
         // --- work out what the game legitimately needs ---
         DirectoryInfo bin = Directory.GetParent(exe);
         if (bin != null && bin.Name.Equals("bin", StringComparison.OrdinalIgnoreCase) && bin.Parent != null)
-            Want(bin.Parent.FullName, RO);   // the Java home
+            Want(javaHome = bin.Parent.FullName, RO);
         else
             Want(exe, RO);
         ScanCommand(cmd);
+        // Lunar Client keeps its jars, natives, profiles, mods, logs and settings in ~/.lunarclient
+        string lunar = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".lunarclient");
+        if (Directory.Exists(lunar) && (string.Join("|", cmd) + "|" + Environment.CurrentDirectory).IndexOf(lunar, StringComparison.OrdinalIgnoreCase) >= 0)
+            Want(lunar, RW);
         string inst = Environment.GetEnvironmentVariable("INST_DIR");   // Prism Launcher / MultiMC
         if (!string.IsNullOrEmpty(inst) && Directory.Exists(inst))
         {
@@ -107,6 +117,18 @@ static class JvmSandbox
         {
             if (!Grant(g.Key, g.Value, true) && !File.Exists(g.Key) && !Directory.Exists(g.Key)) continue;
             for (DirectoryInfo d = Directory.GetParent(g.Key); d != null; d = d.Parent) parents[d.FullName] = true;
+        }
+        // The launcher's own files must not be writable (or, for stored logins, readable) by mods,
+        // even when they sit inside a folder the game may write to.
+        if (javaHome != null)
+            foreach (KeyValuePair<string, uint> g in grants)
+                if ((g.Value & RW) == RW && javaHome.StartsWith(g.Key + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                { Grant(javaHome, WRITE, true, true); break; }
+        foreach (string gd in gameDirs)
+        {
+            if (!Directory.Exists(gd)) continue;
+            foreach (string pat in new string[] { "launcher_accounts*", "launcher_msa_credentials*" })
+                foreach (string f in Directory.GetFiles(gd, pat)) Grant(f, ALL, true, true);
         }
         List<string> needAdmin = new List<string>();
         foreach (string p in parents.Keys)
@@ -170,6 +192,15 @@ static class JvmSandbox
         STARTUPINFOEX si = new STARTUPINFOEX();
         si.StartupInfo.cb = Marshal.SizeOf(si);
         si.lpAttributeList = attrs;
+        // Pass our stdio on explicitly: Windows does not do it by itself for GUI programs like javaw.exe,
+        // and launchers read the game's output through these pipes.
+        IntPtr hIn = GetStdHandle(-10), hOut = GetStdHandle(-11), hErr = GetStdHandle(-12);
+        IntPtr bad = new IntPtr(-1);
+        if ((hIn != IntPtr.Zero && hIn != bad) || (hOut != IntPtr.Zero && hOut != bad) || (hErr != IntPtr.Zero && hErr != bad))
+        {
+            si.StartupInfo.dwFlags |= 0x100; // STARTF_USESTDHANDLES
+            si.StartupInfo.hStdInput = hIn; si.StartupInfo.hStdOutput = hOut; si.StartupInfo.hStdError = hErr;
+        }
         PROCESS_INFORMATION pi;
         StringBuilder cl = new StringBuilder();
         foreach (string a in cmd) { if (cl.Length > 0) cl.Append(' '); Quote(cl, a); }
@@ -178,10 +209,12 @@ static class JvmSandbox
             throw Win32("CreateProcess " + exe);
         AssignProcessToJobObject(job, pi.hProcess);
         ResumeThread(pi.hThread);
+        if (verbose) Log("started " + exe + " (pid " + pi.dwProcessId + ", " + (cmd.Length - 1) + " args) in sandbox " + name);
         Console.CancelKeyPress += delegate(object s, ConsoleCancelEventArgs e) { e.Cancel = true; }; // child gets it too
         WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);
         uint code;
         GetExitCodeProcess(pi.hProcess, out code);
+        if (verbose) Log(Path.GetFileName(exe) + " (pid " + pi.dwProcessId + ") exited with code " + (int)code);
         return (int)code;
     }
 
@@ -194,13 +227,18 @@ static class JvmSandbox
             "  --name <id>    use a separate sandbox identity (isolates instances from each other)\n" +
             "  --no-net       no network access at all\n" +
             "  --lan          also allow LAN access and listening (hosting / LAN worlds)\n" +
+            "  --log <file>   also append this wrapper's messages to a file\n" +
             "  --verbose      print what is being granted\n" +
             "  --no-elevate   never ask for admin rights (skips first-run setup of system folders)\n" +
             "Auto-granted: the Java home (ro), classpath / -jar / -javaagent / java.library.path /\n" +
             "--assetsDir (ro), --gameDir and %INST_DIR% (rw). Everything else is denied.");
     }
 
-    static void Log(string s) { Console.Error.WriteLine("[jvm-sandbox] " + s); }
+    static void Log(string s)
+    {
+        Console.Error.WriteLine("[jvm-sandbox] " + s);
+        if (logPath != null) try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss ") + s + Environment.NewLine); } catch (Exception) { }
+    }
 
     static string ResolveExe(string exe)
     {
@@ -227,7 +265,7 @@ static class JvmSandbox
             else if (a.StartsWith("-Djava.library.path=")) WantList(a.Substring(20));
             else if (a.StartsWith("-javaagent:")) Want(a.Substring(11).Split('=')[0], RO);
             else if (a == "-jar" && next) Want(cmd[++i], RO);
-            else if (a == "--gameDir" && next) Want(cmd[++i], RW);
+            else if (a == "--gameDir" && next) { gameDirs.Add(Path.GetFullPath(cmd[i + 1])); Want(cmd[++i], RW); }
             else if (a == "--assetsDir" && next) Want(cmd[++i], RO);
         }
     }
@@ -275,7 +313,8 @@ static class JvmSandbox
     }
 
     // Returns true if the sandbox has (or now has) the access.
-    static bool Grant(string path, uint access, bool inherit)
+    // With deny=true, adds a deny entry instead (overrides anything inherited from a parent).
+    static bool Grant(string path, uint access, bool inherit, bool deny = false)
     {
         bool dir = Directory.Exists(path);
         if (!dir && !File.Exists(path)) return false;
@@ -283,11 +322,11 @@ static class JvmSandbox
         if (GetNamedSecurityInfoW(path, 1, 4, IntPtr.Zero, IntPtr.Zero, out dacl, IntPtr.Zero, out sd) != 0) return false;
         try
         {
-            if (HasAccess(dacl, access)) return true;   // already granted: nothing to do (keeps relaunches instant)
-            if (inherit && TooBroad(path)) { Log("refusing to grant access to " + path + " (too broad)"); return true; }
+            if (HasAccess(dacl, access, deny)) return true;   // already set: nothing to do (keeps relaunches instant)
+            if (inherit && !deny && TooBroad(path)) { Log("refusing to grant access to " + path + " (too broad)"); return true; }
             EXPLICIT_ACCESS ea = new EXPLICIT_ACCESS();
             ea.grfAccessPermissions = access;
-            ea.grfAccessMode = 1;                   // GRANT_ACCESS
+            ea.grfAccessMode = deny ? 3 : 1;        // DENY_ACCESS : GRANT_ACCESS
             ea.grfInheritance = dir && inherit ? 3u : 0u;      // children inherit
             ea.TrusteeForm = 0;                     // TRUSTEE_IS_SID
             ea.TrusteeType = 5;                     // well-known group
@@ -311,14 +350,14 @@ static class JvmSandbox
                 Marshal.FreeHGlobal(nsd);
             }
             if (rc != 0 && inherit) Log("warning: could not grant access to " + path + " (error " + rc + ")");
-            else if (rc == 0 && verbose) Log("granted " + (access == LIST ? "list " : access == RO ? "ro " : "rw ") + path);
+            else if (rc == 0 && verbose) Log((deny ? "denied " : "granted ") + (access == WRITE ? "write " : access == ALL ? "all " : access == LIST ? "list " : access == RO ? "ro " : "rw ") + path);
             if (newDacl != IntPtr.Zero) LocalFree(newDacl);
             return rc == 0;
         }
         finally { LocalFree(sd); }
     }
 
-    static bool HasAccess(IntPtr dacl, uint want)
+    static bool HasAccess(IntPtr dacl, uint want, bool deny)
     {
         if (dacl == IntPtr.Zero) return false;
         int count = (ushort)Marshal.ReadInt16(dacl, 4);
@@ -328,9 +367,9 @@ static class JvmSandbox
             IntPtr ace;
             if (!GetAce(dacl, (uint)i, out ace)) continue;
             byte type = Marshal.ReadByte(ace, 0), aceFlags = Marshal.ReadByte(ace, 1);
-            if (type != 0 || (aceFlags & 0x8) != 0) continue;   // allow ACEs that apply to this object
+            if (type != (deny ? 1 : 0) || (aceFlags & 0x8) != 0) continue;   // entries that apply to this object
             IntPtr sid = new IntPtr(ace.ToInt64() + 8);
-            if (EqualSid(sid, containerSid) || EqualSid(sid, allPackagesSid))
+            if (EqualSid(sid, containerSid) || (!deny && EqualSid(sid, allPackagesSid)))
                 have |= (uint)Marshal.ReadInt32(ace, 4);
         }
         if ((have & 0x10000000) != 0) return true;              // GENERIC_ALL
@@ -407,6 +446,7 @@ static class JvmSandbox
     [DllImport("advapi32.dll")] static extern bool GetAce(IntPtr acl, uint index, out IntPtr ace);
     [DllImport("advapi32.dll")] static extern bool EqualSid(IntPtr a, IntPtr b);
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attr, IntPtr value, IntPtr size, IntPtr prev, IntPtr retSize);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFOEX si, out PROCESS_INFORMATION pi);
